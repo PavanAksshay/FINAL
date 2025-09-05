@@ -1,0 +1,157 @@
+import numpy as np
+import json
+import matplotlib.pyplot as plt
+from commpy.channelcoding import Trellis, viterbi_decode
+
+# ----------------------
+# QPSK Hard + Soft Demod
+# ----------------------
+def qpsk_demodulate(symbols):
+    """
+    QPSK hard decision demodulation -> bits
+    Gray mapping assumed.
+    """
+    bits = []
+    for s in symbols:
+        bits.append(0 if s.real > 0 else 1)   # bit from real
+        bits.append(0 if s.imag > 0 else 1)   # bit from imag
+    return np.array(bits, dtype=np.uint8)
+
+def estimate_noise_var(symbols):
+    """
+    Blind noise variance estimation using distance to nearest QPSK constellation point.
+    """
+    const_points = np.array([1+1j, 1-1j, -1+1j, -1-1j]) / np.sqrt(2)
+    diffs = symbols.reshape(-1,1) - const_points.reshape(1,-1)
+    dmin = np.min(np.abs(diffs)**2, axis=1)
+    sigma2 = np.mean(dmin) / 2.0   # per real dimension
+    return sigma2
+
+def qpsk_soft_demod(symbols):
+    """
+    QPSK soft decision demodulation -> scaled LLR values.
+    LLR ≈ (2/σ²) * (projection).
+    """
+    sigma2 = estimate_noise_var(symbols)
+    scale = 2.0 / sigma2
+    llrs = []
+    for s in symbols:
+        llrs.append(scale * s.real)   # LLR for first bit
+        llrs.append(scale * s.imag)   # LLR for second bit
+    return np.array(llrs)
+
+# ----------------------
+# Metrics
+# ----------------------
+def calculate_ber_fer(decoded_bits, ref_bits, frame_size=None):
+    """
+    Compare decoded bits against reference bits and return BER and FER.
+    """
+    n = min(len(decoded_bits), len(ref_bits))
+    decoded_bits = decoded_bits[:n]
+    ref_bits = ref_bits[:n]
+
+    # Bit errors
+    bit_errors = np.sum(decoded_bits != ref_bits)
+    ber = bit_errors / n if n > 0 else float("nan")
+
+    # Frame errors
+    if frame_size is None:
+        frame_size = n  # treat as one big frame
+
+    num_frames = n // frame_size
+    fer_count = 0
+    for i in range(num_frames):
+        start, end = i*frame_size, (i+1)*frame_size
+        if np.any(decoded_bits[start:end] != ref_bits[start:end]):
+            fer_count += 1
+    fer = fer_count / num_frames if num_frames > 0 else float("nan")
+
+    return ber, fer, n, bit_errors
+
+# ----------------------
+# Plots
+# ----------------------
+def plot_constellation(symbols, num_points=2000):
+    plt.figure(figsize=(5,5))
+    use = symbols[:num_points]
+    plt.scatter(use.real, use.imag, s=10, alpha=0.5)
+    plt.axhline(0, color="gray", linestyle="--", linewidth=0.7)
+    plt.axvline(0, color="gray", linestyle="--", linewidth=0.7)
+    plt.title("Constellation (first {} symbols)".format(len(use)))
+    plt.xlabel("In-phase (I)")
+    plt.ylabel("Quadrature (Q)")
+    plt.grid(True)
+    plt.axis("equal")
+    plt.show()
+
+def plot_llr_histogram(llrs):
+    plt.figure(figsize=(6,4))
+    plt.hist(llrs, bins=100, alpha=0.75, edgecolor="black")
+    plt.title("LLR Distribution")
+    plt.xlabel("LLR value")
+    plt.ylabel("Count")
+    plt.grid(True)
+    plt.show()
+
+# ----------------------
+# Evaluation
+# ----------------------
+def evaluate_debug(rx_samples, meta_content):
+    print(f"Loaded {len(rx_samples)} complex samples")
+
+    sps = meta_content["sps"]
+    ground_truth_bits = np.array(meta_content["clean_bits"], dtype=np.uint8)
+
+    # --- 1. Symbol extraction ---
+    symbols = rx_samples[::sps]
+    print(f"Extracted {len(symbols)} symbols")
+
+    # Diagnostic: constellation
+    plot_constellation(symbols)
+
+    # --- 2. Hard demod ---
+    raw_bits = qpsk_demodulate(symbols)
+
+    # --- 3. Soft demod + Convolutional decoding ---
+    soft_bits = qpsk_soft_demod(symbols)
+
+    # Diagnostic: LLR histogram
+    plot_llr_histogram(soft_bits)
+
+    # Conv. code: rate 1/2, constraint length 7, polynomials [133, 171] (octal)
+    g_matrix = np.array([[0o133, 0o171]])
+    trellis = Trellis(memory=np.array([6]), g_matrix=g_matrix)
+
+    viterbi_out = viterbi_decode(soft_bits, trellis, tb_depth=50, decoding_type="unquantized")
+
+    # ----------------------
+    # Results
+    # ----------------------
+    print("\n--- RESULTS ---")
+
+    ber, fer, n, bit_errors = calculate_ber_fer(raw_bits, ground_truth_bits, frame_size=512)
+    print(f"Raw hard demod → Compared: {n}, Errors: {bit_errors}, BER: {ber:.3e}, FER: {fer:.2f}")
+
+    ber, fer, n, bit_errors = calculate_ber_fer(viterbi_out, ground_truth_bits, frame_size=512)
+    print(f"After Convolutional decoding → Compared: {n}, Errors: {bit_errors}, BER: {ber:.3e}, FER: {fer:.2f}")
+
+    # Save decoded bits
+    np.save("convolutionalsample001_12db.npy", viterbi_out)
+    print("\n✅ Decoded bits saved to 'convolutionalsample001_12db.npy'")
+
+    return viterbi_out
+
+
+# ----------------------
+# Run
+# ----------------------
+if __name__ == "__main__":
+    RX_PATH = "/Users/pavanaksshay/Dropbox/cubesat_dataset/phase3_coding/convolutional/snr_12db/sample_001/rx.npy"
+    META_PATH = "/Users/pavanaksshay/Dropbox/cubesat_dataset/phase3_coding/convolutional/snr_12db/sample_001/meta.json"
+
+    rx_samples = np.load(RX_PATH)
+    with open(META_PATH, "r") as f:
+        meta_content = json.load(f)
+
+    evaluate_debug(rx_samples, meta_content)
